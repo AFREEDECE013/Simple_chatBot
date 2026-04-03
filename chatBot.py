@@ -1,5 +1,6 @@
 import streamlit as st
-from google import genai
+# from google import genai
+import google.genai as genai
 import os
 from dotenv import load_dotenv
 
