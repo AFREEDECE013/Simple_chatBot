@@ -1,8 +1,8 @@
 import streamlit as st
-# from google import genai
-import google.genai as genai
-import os
+import google.generativeai as genai
+import sqlite3
 from dotenv import load_dotenv
+import os
 
 # -------------------------------
 # CONFIG
@@ -10,10 +10,83 @@ from dotenv import load_dotenv
 SYSTEM_PROMPT = "You are a helpful AI assistant. Answer clearly and concisely."
 MAX_HISTORY = 10
 
+# -------------------------------
+# LOAD ENV (LOCAL)
+# -------------------------------
 load_dotenv()
 
-client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-google_model = os.getenv("GOOGLE_MODEL")
+api_key = None
+
+# Try Streamlit secrets (only if exists)
+try:
+    api_key = st.secrets["GOOGLE_API_KEY"]
+except:
+    api_key = os.getenv("GOOGLE_API_KEY")
+
+# Final check
+if not api_key:
+    st.error("❌ API key not found. Add it in .env (local) or Streamlit secrets (cloud).")
+    st.stop()
+
+genai.configure(api_key=api_key)
+
+try:
+    MODEL_NAME = st.secrets["GOOGLE_MODEL"]
+except:
+    MODEL_NAME = os.getenv("GOOGLE_MODEL", "gemini-1.5-flash")
+
+# -------------------------------
+# DATABASE SETUP
+# -------------------------------
+def init_db():
+    conn = sqlite3.connect("chat.db")
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_name TEXT,
+            role TEXT,
+            message TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_message(chat_name, role, message):
+    conn = sqlite3.connect("chat.db")
+    c = conn.cursor()
+
+    c.execute(
+        "INSERT INTO chats (chat_name, role, message) VALUES (?, ?, ?)",
+        (chat_name, role, message)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def load_chats():
+    conn = sqlite3.connect("chat.db")
+    c = conn.cursor()
+
+    c.execute("SELECT chat_name, role, message FROM chats")
+    rows = c.fetchall()
+
+    conn.close()
+
+    chats = {}
+    for chat_name, role, message in rows:
+        if chat_name not in chats:
+            chats[chat_name] = []
+        chats[chat_name].append((role, message))
+
+    return chats
+
+
+init_db()
 
 # -------------------------------
 # PAGE CONFIG
@@ -51,29 +124,30 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -------------------------------
-# SESSION STATE INIT
+# SESSION STATE
 # -------------------------------
 if "chats" not in st.session_state:
-    st.session_state.chats = {}
+    st.session_state.chats = load_chats()
 
 if "current_chat" not in st.session_state:
-    st.session_state.current_chat = "Chat 1"
-    st.session_state.chats["Chat 1"] = []
+    if st.session_state.chats:
+        st.session_state.current_chat = list(st.session_state.chats.keys())[0]
+    else:
+        st.session_state.current_chat = "Chat 1"
+        st.session_state.chats["Chat 1"] = []
 
 # -------------------------------
-# SIDEBAR (CHATGPT STYLE)
+# SIDEBAR
 # -------------------------------
 st.sidebar.title("💬 Chats")
 
-# New Chat Button
 if st.sidebar.button("➕ New Chat"):
-    new_chat_name = f"Chat {len(st.session_state.chats) + 1}"
-    st.session_state.chats[new_chat_name] = []
-    st.session_state.current_chat = new_chat_name
+    new_chat = f"Chat {len(st.session_state.chats) + 1}"
+    st.session_state.chats[new_chat] = []
+    st.session_state.current_chat = new_chat
 
 st.sidebar.markdown("---")
 
-# Chat List
 for chat_name in st.session_state.chats.keys():
     if chat_name == st.session_state.current_chat:
         st.sidebar.markdown(f"👉 **{chat_name}**")
@@ -82,7 +156,7 @@ for chat_name in st.session_state.chats.keys():
             st.session_state.current_chat = chat_name
 
 # -------------------------------
-# MAIN HEADER
+# MAIN UI
 # -------------------------------
 st.title("💬 AI Assistant")
 
@@ -90,23 +164,30 @@ st.title("💬 AI Assistant")
 # FUNCTION: GET RESPONSE
 # -------------------------------
 def get_response():
-    conversation = SYSTEM_PROMPT + "\n\n"
+    try:
+        conversation = SYSTEM_PROMPT + "\n\n"
 
-    current_chat = st.session_state.chats[st.session_state.current_chat]
-    recent_history = current_chat[-MAX_HISTORY:]
+        current_chat = st.session_state.chats[st.session_state.current_chat]
+        recent_history = current_chat[-MAX_HISTORY:]
 
-    for role, msg in recent_history:
-        if role == "user":
-            conversation += f"User: {msg}\n"
-        else:
-            conversation += f"Assistant: {msg}\n"
+        for role, msg in recent_history:
+            if role == "user":
+                conversation += f"User: {msg}\n"
+            else:
+                conversation += f"Assistant: {msg}\n"
 
-    response = client.models.generate_content(
-        model=google_model,
-        contents=conversation
-    )
+        model = genai.GenerativeModel(MODEL_NAME)
 
-    return response.text if response.text else "⚠️ No response"
+        response = model.generate_content(conversation)
+
+        if not response or not response.text:
+            return "⚠️ Empty response from AI."
+
+        return response.text
+
+    except Exception as e:
+        print("ERROR:", str(e))
+        return "❌ Something went wrong. Please try again."
 
 # -------------------------------
 # DISPLAY CHAT
@@ -129,10 +210,16 @@ st.markdown('</div>', unsafe_allow_html=True)
 user_input = st.chat_input("Type your message...")
 
 if user_input:
-    current_chat.append(("user", user_input))
+    if len(user_input.strip()) == 0:
+        st.warning("⚠️ Please enter a message")
+    else:
+        current_chat.append(("user", user_input))
+        save_message(st.session_state.current_chat, "user", user_input)
 
-    bot_response = get_response()
+        with st.spinner("Thinking... 🤖"):
+            bot_response = get_response()
 
-    current_chat.append(("assistant", bot_response))
+        current_chat.append(("assistant", bot_response))
+        save_message(st.session_state.current_chat, "assistant", bot_response)
 
-    st.rerun()
+        st.rerun()
